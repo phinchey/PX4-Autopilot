@@ -1,11 +1,13 @@
 # Results
 
-Four flights of the route in `fly_furniture.py` (indoor house world,
-x500 with optical flow and a downward ToF-like range finder, `--alt 1.5`,
-fast passes at 3 m/s), one per combination of `EKF2_RNG_OBST` and GPS.
-Each directory holds `altitude.png`, `metrics.json` and `run_info.json`
-produced by `analyze.py` / `fly_furniture.py`; the flight logs (20-30 MB
-each) are not committed (`results/**/*.ulg` is ignored).
+Flights of the route in `fly_furniture.py` (indoor house world, x500 with
+optical flow and a downward ToF-like range finder, `--alt 1.5`, fast
+passes at 3 m/s): one per combination of `EKF2_RNG_OBST` and GPS, plus a
+filmed repeat of the hold-altitude flight without GPS
+(`obst1_nogps_video/flight.mp4`, recorded with `--video`). Each directory
+holds `altitude.png`, `metrics.json` and `run_info.json` produced by
+`analyze.py` / `fly_furniture.py`; the flight logs (20-30 MB each) are not
+committed (`results/**/*.ulg` is ignored).
 
 The commanded altitude is what the position controller holds: 1.33 m above
 the resting position in the EKF frame (1.46 m in `obst0_nogps`; the
@@ -21,6 +23,7 @@ altitude.
 | `obst0_gps` (terrain following) | 0 | yes | 1.02 / 2.81 | 0.35 / 1.48 | 0.32 / 1.35 | 15.5 % | 0 / 0 |
 | `obst1_nogps` (hold altitude) | 1 | no | 0.44 / 1.44 | 0.21 / 0.88 | 0.17 / 0.36 | 0.6 % | 20 / 12 |
 | `obst1_gps` (hold altitude) | 1 | yes | 1.00 / 1.42 | 0.18 / 0.33 | 0.17 / 0.26 | 0.5 % | 14 / 11 |
+| `obst1_nogps_video` (hold altitude, filmed) | 1 | no | 1.03 / 1.42 | 0.28 / 0.43 | 0.27 / 0.45 | 0.5 % | 14 / 9 |
 
 ## What the runs show
 
@@ -67,7 +70,9 @@ range finder:
   was flown with < 0.1 m of position error and no contact;
 * the ~0.15 m constant offset between the estimate and the truth is the
   height creep between arming and take-off mentioned above, and is the same
-  in all four runs.
+  in all runs (0.3 m in `obst0_nogps` and `obst1_nogps_video`, which is
+  why their RMS deviations are larger without the true altitude being any
+  less flat).
 
 ## Reproducing
 

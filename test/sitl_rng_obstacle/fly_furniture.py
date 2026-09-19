@@ -57,6 +57,9 @@ WORLD_SDF = os.path.join(HERE, "worlds", f"{WORLD_NAME}.sdf")
 MODELS_DIR = os.path.join(HERE, "models")
 MODEL_SDF = os.path.join(MODELS_DIR, "x500_flow_tof", "model.sdf")
 MODEL_NAME = "x500_flow_tof_0"
+CAMERAS_SDF = os.path.join(MODELS_DIR, "flight_cameras", "model.sdf")
+CAMERAS_NAME = "flight_cameras"
+VIDEO_VIEWS = ("wide", "side")   # sensor names in flight_cameras/model.sdf
 
 # Spawn point in Gazebo world coordinates (x east, y north).  Faces north
 # (yaw pi/2 in ENU) so that the PX4 heading is ~0.
@@ -215,8 +218,8 @@ def wait_for(predicate, timeout, what, period=1.0):
     raise TimeoutError(f"timed out after {timeout:.0f}s waiting for {what}")
 
 
-def start_gazebo(env, out_dir, render_engine):
-    cmd = ["gz", "sim", "-r", "-s", "--verbose=1"]
+def start_gazebo(env, out_dir, render_engine, run=True):
+    cmd = ["gz", "sim", "-s", "--verbose=1"] + (["-r"] if run else [])
     if render_engine:
         cmd += ["--render-engine", render_engine]
     cmd.append(WORLD_SDF)
@@ -243,6 +246,42 @@ def spawn_model(env):
     lidar = f"/world/{WORLD_NAME}/model/{MODEL_NAME}/link/lidar_sensor_link/sensor/lidar/scan"
     wait_for(lambda: lidar in gz_topics(env), 30, "lidar topic of the spawned model")
     log(f"spawned {MODEL_NAME} at {SPAWN_XY}")
+
+
+def spawn_cameras(env):
+    """Spawn the two static recording cameras (models/flight_cameras)."""
+    sdf = f"<sdf version='1.6'><include><uri>file://{CAMERAS_SDF}</uri><pose>0 0 0 0 0 0</pose></include></sdf>"
+    req = f'name: "{CAMERAS_NAME}", allow_renaming: false, sdf: "{sdf}"'
+    r = subprocess.run(["gz", "service", "-s", f"/world/{WORLD_NAME}/create",
+                        "--reqtype", "gz.msgs.EntityFactory", "--reptype", "gz.msgs.Boolean",
+                        "--timeout", "5000", "--req", req],
+                       capture_output=True, text=True, env=env, timeout=30)
+    if "data: true" not in r.stdout:
+        raise RuntimeError(f"camera spawn failed: {r.stdout} {r.stderr}")
+    wait_for(lambda: f"/video/{VIDEO_VIEWS[-1]}/image" in gz_topics(env), 30, "camera topics")
+    log("spawned the recording cameras")
+
+
+VIDEO = {"env": None, "out_dir": None, "recording": False}
+
+
+def video_record(start):
+    """Start/stop the CameraVideoRecorder of every view (no-op without --video)."""
+    if VIDEO["env"] is None or VIDEO["recording"] == start:
+        return
+    for view in VIDEO_VIEWS:
+        path = os.path.join(VIDEO["out_dir"], f"{view}.mp4")
+        req = f'start: true, format: "mp4", save_filename: "{path}"' if start else "stop: true"
+        r = subprocess.run(["gz", "service", "-s", f"/video/{view}/record",
+                            "--reqtype", "gz.msgs.VideoRecord", "--reptype", "gz.msgs.Boolean",
+                            "--timeout", "5000", "--req", req],
+                           capture_output=True, text=True, env=VIDEO["env"], timeout=30)
+        if "data: true" not in r.stdout:
+            log(f"WARNING: video {'start' if start else 'stop'} failed for {view}: {r.stdout} {r.stderr}")
+    VIDEO["recording"] = start
+    log("video recording " + ("started" if start else "stopped"))
+    if not start:
+        time.sleep(3.0)  # let the encoders finish writing
 
 
 def px4_params(args):
@@ -448,11 +487,50 @@ class Setpoints:
             self._task = None
 
 
+class SimClock:
+    """Simulation time, from PX4 timestamps in the telemetry, interpolated with
+    the wall clock between samples using the measured real-time factor.
+
+    Gazebo runs slower than real time when many sensors render (e.g. with
+    --video); the speed profile must advance in simulation time."""
+
+    def __init__(self):
+        self.anchor_sim = None
+        self.anchor_wall = None
+        self.rtf = 1.0
+
+    def sample(self, sim_t):
+        wall = time.time()
+        if self.anchor_sim is not None:
+            d_sim, d_wall = sim_t - self.anchor_sim, wall - self.anchor_wall
+            if d_sim <= 0.0:
+                return  # duplicate / out-of-order sample
+            if d_wall > 0.05:
+                rtf = max(0.05, min(5.0, d_sim / d_wall))
+                self.rtf = 0.8 * self.rtf + 0.2 * rtf
+        self.anchor_sim, self.anchor_wall = sim_t, wall
+
+    @property
+    def valid(self):
+        return self.anchor_sim is not None
+
+    def now(self):
+        if self.anchor_sim is None:
+            return time.time()
+        return self.anchor_sim + (time.time() - self.anchor_wall) * self.rtf
+
+    async def sleep(self, seconds):
+        t_end = self.now() + seconds
+        while self.now() < t_end:
+            await asyncio.sleep(0.05)
+
+
 class Flight:
     def __init__(self, drone, args, px4_proc=None):
         self.drone = drone
         self.args = args
         self.px4_proc = px4_proc
+        self.clock = SimClock()
         self.pos = None       # latest PositionVelocityNed
         self.armed = False
         self.in_air = False
@@ -477,11 +555,19 @@ class Flight:
             async for a in self.drone.telemetry.in_air():
                 self.in_air = a
 
+        async def clock_odometry():
+            async for o in self.drone.telemetry.odometry():
+                self.clock.sample(o.time_usec / 1e6)
+
+        async def clock_imu():
+            async for i in self.drone.telemetry.imu():
+                self.clock.sample(i.timestamp_us / 1e6)
+
         async def health():
             async for h in self.drone.telemetry.health():
                 self.health = h
 
-        return [asyncio.ensure_future(c()) for c in (pos, armed, in_air, health)]
+        return [asyncio.ensure_future(c()) for c in (pos, armed, in_air, health, clock_odometry, clock_imu)]
 
     async def track_drift(self):
         """Compare the estimate with vehicle_local_position_groundtruth (read
@@ -549,9 +635,9 @@ class Flight:
             s_acc = 0.5 * ACCEL_M_S2 * t_acc ** 2
             t_cruise = (length - 2 * s_acc) / v_peak
             t_total = 2 * t_acc + t_cruise
-            t0 = time.time()
+            t0 = self.clock.now()
             while True:
-                t = time.time() - t0
+                t = self.clock.now() - t0
                 if t >= t_total:
                     break
                 if t < t_acc:
@@ -571,7 +657,7 @@ class Flight:
         await self.wait_within(n1, e1, d, WP_REACHED_M, length / max(speed, 0.5) + 15.0, label)
         if hover_s > 0:
             log(f"hovering {hover_s:.0f} s")
-            await asyncio.sleep(hover_s)
+            await self.clock.sleep(hover_s)
 
     async def run(self):
         drone, args = self.drone, self.args
@@ -597,6 +683,7 @@ class Flight:
         heading = heading.yaw_deg
         self.n0, self.e0 = self.pos.position.north_m, self.pos.position.east_m
         log(f"local position ok: n={self.n0:.2f} e={self.e0:.2f} d={self.pos.position.down_m:.2f} heading={heading:.1f} deg")
+        video_record(True)
 
         # ----- offboard + arm + climb
         self.sp = Setpoints(drone, heading)
@@ -639,7 +726,9 @@ class Flight:
                 log(f"cruise z setpoint {self.d_cruise:.2f} (--alt-trim {args.alt_trim:+.2f})")
                 self.sp.set(self.n0, self.e0, self.d_cruise)
                 await self.wait_within(self.n0, self.e0, self.d_cruise, 0.15, 15, "altitude trim")
-        log("at cruise altitude, starting route")
+        log("at cruise altitude, starting route"
+            + (f" (sim clock ok, real-time factor {self.clock.rtf:.2f})" if self.clock.valid
+               else " (WARNING: no PX4 timestamps in the telemetry, profile uses the wall clock)"))
         drift_task = asyncio.ensure_future(self.track_drift()) if self.px4_proc else None
 
         # ----- route
@@ -669,6 +758,7 @@ class Flight:
                 except Exception as err:
                     log(f"kill failed: {err}")
         log("landed and disarmed")
+        video_record(False)
         for t in tele:
             t.cancel()
 
@@ -692,6 +782,30 @@ async def fly(args, px4_proc):
 
 # --------------------------------------------------------------------------
 
+def combine_video(out_dir):
+    """side.mp4 with wide.mp4 as an inset -> flight.mp4, if ffmpeg is available."""
+    inputs = {v: os.path.join(out_dir, f"{v}.mp4") for v in VIDEO_VIEWS}
+    if not all(os.path.exists(p) for p in inputs.values()):
+        log("WARNING: not all camera videos were written: " + ", ".join(inputs.values()))
+        return
+    if not shutil.which("ffmpeg"):
+        log("ffmpeg not found; leaving the per-camera videos as they are")
+        return
+    # The side view (camera at 1.05 m, level) shows the altitude against the
+    # furniture; the corner view is a picture-in-picture inset top right.
+    filt = ("[1:v]scale=960:540[main];[0:v]scale=384:216[pip];"
+            "[main][pip]overlay=W-w-16:16[out]")
+    out = os.path.join(out_dir, "flight.mp4")
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", inputs["wide"], "-i", inputs["side"],
+           "-filter_complex", filt, "-map", "[out]", "-c:v", "libx264", "-preset", "medium",
+           "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart", out]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode == 0:
+        log(f"video written to {out}")
+    else:
+        log(f"WARNING: ffmpeg failed: {r.stderr.strip()}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--obst", type=int, choices=(0, 1), required=True, help="EKF2_RNG_OBST value")
@@ -706,6 +820,8 @@ def main():
     ap.add_argument("--render-engine", default=None,
                     help="gz render engine override (e.g. ogre) if ogre2 sensors do not render headless")
     ap.add_argument("--keep", action="store_true", help="leave PX4 and gz running after the flight")
+    ap.add_argument("--video", action="store_true",
+                    help="film the flight with two static cameras (wide.mp4, side.mp4, combined flight.mp4)")
     args = ap.parse_args()
 
     if args.out is None:
@@ -724,12 +840,16 @@ def main():
     try:
         gz_proc = start_gazebo(env, args.out, args.render_engine)
         spawn_model(env)
+        if args.video:
+            spawn_cameras(env)
+            VIDEO.update(env=env, out_dir=args.out)
         px4_proc, params = start_px4(env, args, args.out)
         asyncio.run(asyncio.wait_for(fly(args, px4_proc), timeout=300))
         status = "ok"
     except Exception as err:
         log(f"ERROR: {err!r}")
     finally:
+        video_record(False)
         if args.keep and status == "ok":
             log("--keep: leaving PX4 and gz running")
         else:
@@ -746,6 +866,8 @@ def main():
         log(f"log copied to {copied}")
     else:
         log("WARNING: no new .ulg found under " + os.path.join(ROOTFS, "fs", "log"))
+    if args.video:
+        combine_video(args.out)
     with open(os.path.join(args.out, "run_info.json"), "w") as f:
         json.dump({"status": status, "args": vars(args), "px4_params": params,
                    "ulg": os.path.basename(copied) if copied else None,
