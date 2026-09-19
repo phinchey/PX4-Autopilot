@@ -818,6 +818,14 @@ private:
 	// update the terrain vertical position estimate using a height above ground measurement from the range finder
 	bool fuseHaglRng(estimator_aid_source1d_s &aid_src, bool update_height, bool update_terrain);
 	void resetTerrainToRng(estimator_aid_source1d_s &aid_src);
+	void resetTerrainToRngHoldHeight(estimator_aid_source1d_s &aid_src);
+	bool isRangeStepCandidate(const estimator_aid_source1d_s &aid_src, float innov_gate) const;
+	bool isRangeObstacleRejectionActive() const
+	{
+		return (_params.ekf2_rng_obst != 0)
+		       && _control_status.flags.rng_hgt
+		       && (_height_sensor_ref == HeightSensor::RANGE);
+	}
 	float getRngVar() const;
 # endif // CONFIG_EKF2_RANGE_FINDER
 
@@ -832,6 +840,9 @@ private:
 	void controlRangeHaglFusion(const imuSample &imu_delayed);
 	bool isConditionalRangeAidSuitable();
 	void stopRngHgtFusion();
+
+	uint64_t _time_rng_step_start_us{0};	///< time the range finder measurement started being rejected by the innovation gate (obstacle rejection) (uSec)
+	float _rng_obst_terrain_prev{NAN};	///< terrain state before the last obstacle terrain reset, used to re-anchor the height when flying back over the same surface (m)
 	void stopRngTerrFusion();
 #endif // CONFIG_EKF2_RANGE_FINDER
 

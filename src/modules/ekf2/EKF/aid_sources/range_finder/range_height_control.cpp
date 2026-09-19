@@ -121,8 +121,10 @@ void Ekf::controlRangeHaglFusion(const imuSample &imu_sample)
 
 		// z special case if there is bad vertical acceleration data, then don't reject measurement,
 		// but limit innovation to prevent spikes that could destabilise the filter
+		// (not when holding altitude over obstacles: a rejected measurement is then a candidate terrain step)
 		if (_fault_status.flags.bad_acc_vertical && aid_src.innovation_rejected
 		    && measurement_valid && _range_sensor.isDataHealthy()
+		    && !isRangeObstacleRejectionActive()
 		   ) {
 			const float innov_limit = innov_gate * sqrtf(aid_src.innovation_variance);
 			aid_src.innovation = math::constrain(aid_src.innovation, -innov_limit, innov_limit);
@@ -167,17 +169,30 @@ void Ekf::controlRangeHaglFusion(const imuSample &imu_sample)
 					}
 
 				} else if (do_range_aid) {
-					// Range finder is the primary height source, the ground is now the datum used
-					// to compute the local vertical position
-					ECL_INFO("starting %s height fusion, resetting height", HGT_SRC_NAME);
 					_height_sensor_ref = HeightSensor::RANGE;
-
-					_information_events.flags.reset_hgt_to_rng = true;
-					resetAltitudeTo(aid_src.observation, aid_src.observation_variance);
-					_state.terrain = 0.f;
-					resetAidSourceStatusZeroInnovation(aid_src);
 					_control_status.flags.rng_hgt = true;
 					stopRngTerrFusion();
+
+					if ((_params.ekf2_rng_obst != 0)
+					    && _control_status.flags.in_air
+					    && isRecent(_time_last_hgt_fuse, _params.hgt_fusion_timeout_max)) {
+						// Holding altitude over obstacles and the height is still supported by another
+						// height source (or by recent range fusion): keep the height and move the terrain
+						// to the range finder, the surface below may have changed while the range was not usable
+						ECL_INFO("starting %s height fusion, resetting terrain", HGT_SRC_NAME);
+						resetTerrainToRngHoldHeight(aid_src);
+
+					} else {
+						// Range finder is the primary height source, the ground is now the datum used
+						// to compute the local vertical position
+						ECL_INFO("starting %s height fusion, resetting height", HGT_SRC_NAME);
+
+						_information_events.flags.reset_hgt_to_rng = true;
+						resetAltitudeTo(aid_src.observation, aid_src.observation_variance);
+						_state.terrain = 0.f;
+						_rng_obst_terrain_prev = NAN;
+						resetAidSourceStatusZeroInnovation(aid_src);
+					}
 
 					aid_src.time_last_fuse = imu_sample.time_us;
 				}
@@ -199,17 +214,46 @@ void Ekf::controlRangeHaglFusion(const imuSample &imu_sample)
 		if (_control_status.flags.rng_hgt || _control_status.flags.rng_terrain) {
 			if (continuing_conditions_passing) {
 
+				const bool rng_is_configured_ref = do_range_aid && _control_status.flags.rng_hgt
+								   && (_params.ekf2_hgt_ref == static_cast<int32_t>(HeightSensor::RANGE));
+
 				if (do_conditional_range_aid) {
 					_height_sensor_ref = HeightSensor::RANGE;
 
-				} else if (_height_sensor_ref == HeightSensor::RANGE) {
+				} else if ((_height_sensor_ref == HeightSensor::RANGE) && !rng_is_configured_ref) {
 					_height_sensor_ref = HeightSensor::UNKNOWN;
 				}
 
-				if (_range_sensor.isDataHealthy()
-				    && _control_status.flags.rng_kin_consistent
-				   ) {
-					fuseHaglRng(aid_src, _control_status.flags.rng_hgt, _control_status.flags.rng_terrain);
+				if (_range_sensor.isDataHealthy()) {
+					bool terrain_reset = false;
+
+					if (isRangeObstacleRejectionActive() && isRangeStepCandidate(aid_src, innov_gate)) {
+						// The distance to the surface below changed while the vehicle height is still supported
+						// by the inertial data: once the step has persisted, attribute it to the terrain
+						// (furniture, a step, ...) instead of the vehicle height
+						aid_src.innovation_rejected = true;
+
+						if (_time_rng_step_start_us == 0) {
+							_time_rng_step_start_us = imu_sample.time_us;
+
+						} else if ((imu_sample.time_us - _time_rng_step_start_us)
+							   >= static_cast<uint64_t>(_params.ekf2_rng_obst_t * 1e6f)) {
+							ECL_INFO("%s step, resetting terrain", HGT_SRC_NAME);
+							resetTerrainToRngHoldHeight(aid_src);
+							_time_rng_step_start_us = 0;
+							terrain_reset = true;
+						}
+
+					} else {
+						_time_rng_step_start_us = 0;
+					}
+
+					if (!terrain_reset && _control_status.flags.rng_kin_consistent) {
+						fuseHaglRng(aid_src, _control_status.flags.rng_hgt, _control_status.flags.rng_terrain);
+					}
+
+				} else {
+					_time_rng_step_start_us = 0;
 				}
 
 				const bool is_fusion_failing = isTimedOut(aid_src.time_last_fuse, _params.hgt_fusion_timeout_max);
@@ -323,6 +367,74 @@ void Ekf::resetTerrainToRng(estimator_aid_source1d_s &aid_src)
 	aid_src.time_last_fuse = _time_delayed_us;
 }
 
+bool Ekf::isRangeStepCandidate(const estimator_aid_source1d_s &aid_src, float innov_gate) const
+{
+	// A change of the surface below the vehicle is a jump of the measured distance that is not
+	// explained by the vehicle motion. The innovation gate scales with the height uncertainty, so
+	// it can be much wider than the step; the step is therefore also compared with the range
+	// finder noise only (the terrain is known to the precision of the range finder)
+	const float rng_var = sq(_params.ekf2_rng_noise) + sq(_params.ekf2_rng_sfe * _range_sensor.getRange());
+	const float step_threshold = innov_gate * sqrtf(2.f * rng_var);
+
+	return aid_src.innovation_rejected || (fabsf(aid_src.innovation) > step_threshold);
+}
+
+void Ekf::resetTerrainToRngHoldHeight(estimator_aid_source1d_s &aid_src)
+{
+	// The surface below the vehicle changed (obstacle, step, ...) while the vehicle height is still
+	// supported by the inertial data: move the terrain to match the range finder and keep the height.
+	// The new terrain is considered known to the precision of the range finder, so that the range
+	// finder keeps anchoring the height to it.
+	const float terrain_before_step = _state.terrain;
+	float new_terrain = -_gpos.altitude() + aid_src.observation;
+
+	// When the vehicle is back over the surface it was flying over before the last step (e.g. the
+	// floor after crossing a table), re-anchor the height to that surface instead so that the small
+	// height error accumulated while the range finder was rejected does not become a permanent
+	// offset of the height datum. The tolerance follows the height uncertainty but is capped so that
+	// a distinct surface is never mistaken for the previous one after a long range finder outage.
+	static constexpr float kSameLevelToleranceMax = 0.3f; // (m)
+	const float same_level_tolerance = fminf(3.f * sqrtf(P(State::pos.idx + 2, State::pos.idx + 2)
+					   + aid_src.observation_variance), kSameLevelToleranceMax);
+
+	if (PX4_ISFINITE(_rng_obst_terrain_prev)
+	    && (fabsf(new_terrain - _rng_obst_terrain_prev) < same_level_tolerance)) {
+		new_terrain = _rng_obst_terrain_prev;
+
+		ECL_INFO("RNG back over previous surface, re-anchoring height");
+		_information_events.flags.reset_hgt_to_rng = true;
+		resetAltitudeTo(aid_src.observation - new_terrain); // also shifts the terrain state and records it
+	}
+
+	_rng_obst_terrain_prev = terrain_before_step;
+
+	const float old_terrain = _state.terrain;
+	_state.terrain = new_terrain;
+
+	// the terrain is now known to the precision of the range finder
+	const float terrain_var = sq(_params.ekf2_rng_noise) + sq(_params.ekf2_rng_sfe * _range_sensor.getRange());
+	P.uncorrelateCovarianceSetVariance<State::terrain.dof>(State::terrain.idx, terrain_var);
+
+	// record the state change
+	const float delta_terrain = _state.terrain - old_terrain;
+
+	if (_state_reset_status.reset_count.hagl == _state_reset_count_prev.hagl) {
+		_state_reset_status.hagl_change = delta_terrain;
+
+	} else {
+		// there's already a reset this update, accumulate total delta
+		_state_reset_status.hagl_change += delta_terrain;
+	}
+
+	_state_reset_status.reset_count.hagl++;
+
+	resetAidSourceStatusZeroInnovation(aid_src);
+
+	// the change of distance is explained by the terrain, the data is not considered faulty
+	_rng_consistency_check.setConsistent();
+	_control_status.flags.rng_kin_consistent = true;
+}
+
 bool Ekf::isConditionalRangeAidSuitable()
 {
 	// check if we can use range finder measurements to estimate height, use hysteresis to avoid rapid switching
@@ -360,6 +472,7 @@ void Ekf::stopRngHgtFusion()
 		}
 
 		_control_status.flags.rng_hgt = false;
+		_time_rng_step_start_us = 0;
 	}
 }
 

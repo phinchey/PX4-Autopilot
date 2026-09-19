@@ -617,6 +617,226 @@ TEST_F(EkfHeightFusionTest, rngTerrainOnlyIsNotAHeightSource)
 	EXPECT_FALSE(_ekf_wrapper.isIntendingRangeHeightFusion());
 }
 
+TEST_F(EkfHeightFusionTest, rngRefFollowsTerrainWithoutObstacleRejection)
+{
+	// GIVEN: the range finder is the height reference and the default behaviour (no obstacle rejection)
+	_ekf_wrapper.setRangeHeightRef();
+	_ekf_wrapper.enableRangeHeightFusion();
+	_ekf_wrapper.enableBaroHeightFusion();
+	_sensor_simulator.runSeconds(2);
+
+	ASSERT_TRUE(_ekf_wrapper.isIntendingRangeHeightFusion());
+	ASSERT_TRUE(_ekf->getHeightSensorRef() == HeightSensor::RANGE);
+	ASSERT_NEAR(_ekf->getHagl(), 1.f, 0.1f);
+
+	const float z_before = _ekf->getPosition()(2);
+
+	// WHEN: the vehicle flies over a 0.3m high obstacle (the step is within the innovation gate)
+	_sensor_simulator._rng.setData(0.7f, 100);
+	_sensor_simulator.runSeconds(5);
+
+	// THEN: the ground is the datum, the height estimate follows the surface below (terrain following)
+	EXPECT_NEAR(_ekf->getPosition()(2) - z_before, 0.3f, 0.1f);
+	EXPECT_NEAR(_ekf->getHagl(), 0.7f, 0.1f);
+}
+
+TEST_F(EkfHeightFusionTest, rngRefObstacleRejectionHoldsHeightOverStep)
+{
+	// GIVEN: the range finder is the height reference with obstacle rejection enabled
+	// and the baro contributing
+	_ekf_wrapper.setRangeHeightRef();
+	_ekf_wrapper.enableRangeHeightFusion();
+	_ekf_wrapper.enableBaroHeightFusion();
+	_ekf->getParamHandle()->ekf2_rng_obst = 1;
+	_ekf->getParamHandle()->ekf2_rng_noise = 0.05f;
+	_ekf->getParamHandle()->ekf2_rng_obst_t = 0.5f;
+	_sensor_simulator.runSeconds(2);
+
+	ASSERT_TRUE(_ekf_wrapper.isIntendingRangeHeightFusion());
+	ASSERT_TRUE(_ekf_wrapper.isIntendingBaroHeightFusion());
+	ASSERT_TRUE(_ekf->getHeightSensorRef() == HeightSensor::RANGE);
+	ASSERT_NEAR(_ekf->getHagl(), 1.f, 0.1f);
+
+	const float z_before = _ekf->getPosition()(2);
+	const float terrain_before = _ekf->getTerrainVertPos();
+	const uint8_t hagl_reset_count = _ekf->get_hagl_reset_count();
+	const uint8_t z_reset_count = _ekf->get_posD_reset_count();
+
+	// WHEN: the vehicle flies over a 0.6m high table
+	_sensor_simulator._rng.setData(0.4f, 100);
+	_sensor_simulator.runSeconds(0.3);
+
+	// THEN: the step is rejected and nothing is reset yet
+	EXPECT_TRUE(_ekf->aid_src_rng_hgt().innovation_rejected);
+	EXPECT_EQ(_ekf->get_hagl_reset_count(), hagl_reset_count);
+	EXPECT_NEAR(_ekf->getPosition()(2), z_before, 0.05f);
+
+	// AND WHEN: the step persists longer than the confirmation time
+	_sensor_simulator.runSeconds(1.f);
+
+	// THEN: the step is attributed to the terrain, the height is unchanged and the range finder
+	// is fused again against the new terrain
+	EXPECT_EQ(_ekf->get_hagl_reset_count(), hagl_reset_count + 1);
+	EXPECT_EQ(_ekf->get_posD_reset_count(), z_reset_count);
+	EXPECT_NEAR(_ekf->getPosition()(2), z_before, 0.05f);
+	EXPECT_NEAR(_ekf->getHagl(), 0.4f, 0.05f);
+	EXPECT_NEAR(_ekf->getTerrainVertPos(), terrain_before - 0.6f, 0.05f);
+	EXPECT_TRUE(_ekf->aid_src_rng_hgt().fused);
+	EXPECT_TRUE(_ekf->getHeightSensorRef() == HeightSensor::RANGE);
+
+	// AND WHEN: the vehicle is back over the floor
+	_sensor_simulator._rng.setData(1.f, 100);
+	_sensor_simulator.runSeconds(1.5f);
+
+	// THEN: the terrain is back to the floor, and the height is re-anchored to it (a small height
+	// reset, which is also recorded as a terrain reset)
+	EXPECT_EQ(_ekf->get_hagl_reset_count(), hagl_reset_count + 3);
+	EXPECT_EQ(_ekf->get_posD_reset_count(), z_reset_count + 1);
+	EXPECT_NEAR(_ekf->getPosition()(2), z_before, 0.05f);
+	EXPECT_NEAR(_ekf->getHagl(), 1.f, 0.05f);
+	EXPECT_NEAR(_ekf->getTerrainVertPos(), terrain_before, 0.01f);
+	EXPECT_TRUE(_ekf->aid_src_rng_hgt().fused);
+}
+
+TEST_F(EkfHeightFusionTest, rngRefObstacleRejectionRangeOnly)
+{
+	// GIVEN: the range finder is the height reference with obstacle rejection enabled and
+	// no other height source at all
+	_ekf_wrapper.setRangeHeightRef();
+	_ekf_wrapper.enableRangeHeightFusion();
+	_ekf->getParamHandle()->ekf2_rng_obst = 1;
+	_ekf->getParamHandle()->ekf2_rng_noise = 0.05f;
+	_sensor_simulator.runSeconds(2);
+
+	ASSERT_TRUE(_ekf_wrapper.isIntendingRangeHeightFusion());
+	ASSERT_FALSE(_ekf_wrapper.isIntendingBaroHeightFusion());
+	ASSERT_EQ(_ekf->getNumberOfActiveVerticalPositionAidingSources(), 1);
+	ASSERT_TRUE(_ekf->getHeightSensorRef() == HeightSensor::RANGE);
+
+	const float z_before = _ekf->getPosition()(2);
+	const uint8_t z_reset_count = _ekf->get_posD_reset_count();
+
+	// WHEN: the vehicle flies over a 0.6m high table for a while and leaves it
+	_sensor_simulator._rng.setData(0.4f, 100);
+	_sensor_simulator.runSeconds(3);
+
+	// THEN: the height is held by the inertial data during the step and kept afterwards
+	// (no height reset to the range finder)
+	EXPECT_NEAR(_ekf->getPosition()(2), z_before, 0.05f);
+	EXPECT_NEAR(_ekf->getHagl(), 0.4f, 0.05f);
+	EXPECT_TRUE(_ekf->aid_src_rng_hgt().fused);
+	EXPECT_EQ(_ekf->get_posD_reset_count(), z_reset_count);
+
+	_sensor_simulator._rng.setData(1.f, 100);
+	_sensor_simulator.runSeconds(3);
+
+	// the height is re-anchored to the floor by a small reset only
+	EXPECT_NEAR(_ekf->getPosition()(2), z_before, 0.05f);
+	EXPECT_NEAR(_ekf->getHagl(), 1.f, 0.05f);
+	EXPECT_TRUE(_ekf_wrapper.isIntendingRangeHeightFusion());
+	EXPECT_TRUE(_ekf->getHeightSensorRef() == HeightSensor::RANGE);
+}
+
+TEST_F(EkfHeightFusionTest, rngRefObstacleRejectionIgnoresShortStep)
+{
+	// GIVEN: the range finder is the height reference with obstacle rejection enabled
+	_ekf_wrapper.setRangeHeightRef();
+	_ekf_wrapper.enableRangeHeightFusion();
+	_ekf_wrapper.enableBaroHeightFusion();
+	_ekf->getParamHandle()->ekf2_rng_obst = 1;
+	_ekf->getParamHandle()->ekf2_rng_noise = 0.05f;
+	_ekf->getParamHandle()->ekf2_rng_obst_t = 0.5f;
+	_sensor_simulator.runSeconds(2);
+
+	ASSERT_TRUE(_ekf->getHeightSensorRef() == HeightSensor::RANGE);
+
+	const float z_before = _ekf->getPosition()(2);
+	const float terrain_before = _ekf->getTerrainVertPos();
+	const uint8_t hagl_reset_count = _ekf->get_hagl_reset_count();
+
+	// WHEN: the vehicle crosses a narrow obstacle in less than the confirmation time
+	_sensor_simulator._rng.setData(0.4f, 100);
+	_sensor_simulator.runSeconds(0.3);
+	_sensor_simulator._rng.setData(1.f, 100);
+	_sensor_simulator.runSeconds(2);
+
+	// THEN: neither the height nor the terrain estimate are affected
+	EXPECT_EQ(_ekf->get_hagl_reset_count(), hagl_reset_count);
+	EXPECT_NEAR(_ekf->getPosition()(2), z_before, 0.05f);
+	EXPECT_NEAR(_ekf->getTerrainVertPos(), terrain_before, 0.02f);
+	EXPECT_NEAR(_ekf->getHagl(), 1.f, 0.05f);
+	EXPECT_FALSE(_ekf->aid_src_rng_hgt().innovation_rejected);
+}
+
+TEST_F(EkfHeightFusionTest, rngRefObstacleRejectionRestartInFlightKeepsHeight)
+{
+	// GIVEN: the range finder is the height reference with obstacle rejection enabled
+	// and the baro contributing
+	_ekf_wrapper.setRangeHeightRef();
+	_ekf_wrapper.enableRangeHeightFusion();
+	_ekf_wrapper.enableBaroHeightFusion();
+	_ekf->getParamHandle()->ekf2_rng_obst = 1;
+	_ekf->getParamHandle()->ekf2_rng_noise = 0.05f;
+	_sensor_simulator.runSeconds(2);
+
+	ASSERT_TRUE(_ekf->getHeightSensorRef() == HeightSensor::RANGE);
+
+	const float z_before = _ekf->getPosition()(2);
+	const uint8_t z_reset_count = _ekf->get_posD_reset_count();
+
+	// WHEN: the range finder briefly stops delivering data (e.g. no return over a dark surface)
+	// and comes back over a 0.6m high table
+	_sensor_simulator.stopRangeFinder();
+	_sensor_simulator.runSeconds(0.6);
+	EXPECT_FALSE(_ekf_wrapper.isIntendingRangeHeightFusion());
+	EXPECT_TRUE(_ekf->getHeightSensorRef() == HeightSensor::BARO);
+
+	_sensor_simulator._rng.setData(0.4f, 100);
+	_sensor_simulator.startRangeFinder();
+	_sensor_simulator.runSeconds(3);
+
+	// THEN: the range finder is the height reference again, the height was not reset
+	// and the terrain was moved to the table
+	EXPECT_TRUE(_ekf_wrapper.isIntendingRangeHeightFusion());
+	EXPECT_TRUE(_ekf->getHeightSensorRef() == HeightSensor::RANGE);
+	EXPECT_EQ(_ekf->get_posD_reset_count(), z_reset_count);
+	EXPECT_NEAR(_ekf->getPosition()(2), z_before, 0.1f);
+	EXPECT_NEAR(_ekf->getHagl(), 0.4f, 0.05f);
+}
+
+TEST_F(EkfHeightFusionTest, rngRefObstacleRejectionRestartInFlightReanchorsToKnownSurface)
+{
+	// GIVEN: the range finder is the height reference with obstacle rejection enabled
+	// and the baro contributing
+	_ekf_wrapper.setRangeHeightRef();
+	_ekf_wrapper.enableRangeHeightFusion();
+	_ekf_wrapper.enableBaroHeightFusion();
+	_ekf->getParamHandle()->ekf2_rng_obst = 1;
+	_ekf->getParamHandle()->ekf2_rng_noise = 0.05f;
+	_sensor_simulator.runSeconds(2);
+
+	ASSERT_TRUE(_ekf->getHeightSensorRef() == HeightSensor::RANGE);
+
+	const float z_before = _ekf->getPosition()(2);
+	const float terrain_before = _ekf->getTerrainVertPos();
+
+	// WHEN: the range finder stops delivering data for long enough for the height uncertainty
+	// to grow and comes back over the floor
+	_sensor_simulator.stopRangeFinder();
+	_sensor_simulator.runSeconds(4);
+	EXPECT_TRUE(_ekf->getHeightSensorRef() == HeightSensor::BARO);
+
+	_sensor_simulator.startRangeFinder();
+	_sensor_simulator.runSeconds(3);
+
+	// THEN: the measured distance is consistent with the floor, so the height is re-anchored to it
+	// instead of moving the terrain
+	EXPECT_TRUE(_ekf->getHeightSensorRef() == HeightSensor::RANGE);
+	EXPECT_NEAR(_ekf->getTerrainVertPos(), terrain_before, 0.01f);
+	EXPECT_NEAR(_ekf->getPosition()(2), z_before, 0.1f);
+	EXPECT_NEAR(_ekf->getHagl(), 1.f, 0.05f);
+}
+
 TEST_F(EkfHeightFusionTest, changeEkfOriginAlt)
 {
 	_sensor_simulator.startBaro();

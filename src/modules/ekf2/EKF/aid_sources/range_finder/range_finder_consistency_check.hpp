@@ -52,6 +52,14 @@ public:
 
 	void setGate(float gate) { _gate = gate; }
 
+	// Consider the data consistent again, e.g. once a change of the measured distance
+	// has been attributed to a change of the terrain height below the vehicle
+	void setConsistent()
+	{
+		_signed_test_ratio_lpf.reset(0.f);
+		_is_kinematically_consistent = true;
+	}
+
 	float getTestRatio() const { return _test_ratio; }
 	float getSignedTestRatioLpf() const { return _signed_test_ratio_lpf.getState(); }
 	float getInnov() const { return _innov; }

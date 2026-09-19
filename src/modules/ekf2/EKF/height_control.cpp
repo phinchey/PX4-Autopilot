@@ -215,8 +215,10 @@ Likelihood Ekf::estimateInertialNavFallingLikelihood() const
 
 #if defined(CONFIG_EKF2_RANGE_FINDER)
 
-	if (_control_status.flags.rng_hgt) {
+	if (_control_status.flags.rng_hgt && !isRangeObstacleRejectionActive()) {
 		// Range is a distance to ground measurement, not a direct height observation and has an opposite sign
+		// (when holding altitude over obstacles, large range innovations are expected and are not
+		// evidence of the inertial navigation falling)
 		checks[3] = {ReferenceType::GROUND, -_aid_src_rng_hgt.innovation, _aid_src_rng_hgt.innovation_variance};
 	}
 

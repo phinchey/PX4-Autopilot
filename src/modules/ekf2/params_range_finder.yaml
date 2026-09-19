@@ -83,6 +83,41 @@ parameters:
       min: 1.0
       max: 10.0
       unit: m
+    EKF2_RNG_OBST:
+      description:
+        short: Hold altitude over obstacles when the range finder is the height reference
+        long: 'Only used while the range finder is the height reference (EKF2_HGT_REF = 2)
+          and range fusion is enabled (EKF2_RNG_CTRL). When disabled, the surface below the
+          vehicle is the height datum, so the vehicle follows the terrain profile: it climbs
+          when flying over a table and descends again behind it. When enabled, a sudden change
+          of the measured distance that is not explained by the vertical motion of the vehicle
+          is attributed to the surface below (furniture, a step, ...) instead of the vehicle
+          height: the estimated terrain is moved to match the range finder once the step has
+          persisted for EKF2_RNG_OBST_T, while the vehicle altitude is kept, as it would be with
+          a barometer or GNSS height reference. Obstacles crossed in less than EKF2_RNG_OBST_T
+          never affect the height estimate. The range finder keeps correcting the height
+          whenever its measurement is consistent with the current terrain estimate, and the
+          height is re-anchored to the previous surface when the vehicle returns to it.
+          Steps smaller than the innovation gate are still fused as height changes, so tune
+          EKF2_RNG_NOISE and EKF2_RNG_GATE to the sensor.'
+      type: enum
+      values:
+        0: Disabled (follow terrain)
+        1: Enabled (hold altitude)
+      default: 0
+    EKF2_RNG_OBST_T:
+      description:
+        short: Range finder obstacle confirmation time
+        long: Duration during which the range finder measurement must be continuously rejected
+          by the innovation gate before the change of distance is attributed to the surface
+          below the vehicle (EKF2_RNG_OBST = 1). Increase to ignore wider obstacles when flying
+          fast, decrease to lock faster onto a new surface.
+      type: float
+      default: 0.5
+      min: 0.1
+      max: 5.0
+      unit: s
+      decimal: 1
     EKF2_RNG_QLTY_T:
       description:
         short: Minimum range validity period
