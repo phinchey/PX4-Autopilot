@@ -649,7 +649,6 @@ TEST_F(EkfHeightFusionTest, rngRefObstacleRejectionHoldsHeightOverStep)
 	_ekf_wrapper.enableBaroHeightFusion();
 	_ekf->getParamHandle()->ekf2_rng_obst = 1;
 	_ekf->getParamHandle()->ekf2_rng_noise = 0.05f;
-	_ekf->getParamHandle()->ekf2_rng_obst_t = 0.5f;
 	_sensor_simulator.runSeconds(2);
 
 	ASSERT_TRUE(_ekf_wrapper.isIntendingRangeHeightFusion());
@@ -664,14 +663,6 @@ TEST_F(EkfHeightFusionTest, rngRefObstacleRejectionHoldsHeightOverStep)
 
 	// WHEN: the vehicle flies over a 0.6m high table
 	_sensor_simulator._rng.setData(0.4f, 100);
-	_sensor_simulator.runSeconds(0.3);
-
-	// THEN: the step is rejected and nothing is reset yet
-	EXPECT_TRUE(_ekf->aid_src_rng_hgt().innovation_rejected);
-	EXPECT_EQ(_ekf->get_hagl_reset_count(), hagl_reset_count);
-	EXPECT_NEAR(_ekf->getPosition()(2), z_before, 0.05f);
-
-	// AND WHEN: the step persists longer than the confirmation time
 	_sensor_simulator.runSeconds(1.f);
 
 	// THEN: the step is attributed to the terrain, the height is unchanged and the range finder
@@ -737,7 +728,7 @@ TEST_F(EkfHeightFusionTest, rngRefObstacleRejectionRangeOnly)
 	EXPECT_TRUE(_ekf->getHeightSensorRef() == HeightSensor::RANGE);
 }
 
-TEST_F(EkfHeightFusionTest, rngRefObstacleRejectionIgnoresShortStep)
+TEST_F(EkfHeightFusionTest, rngRefObstacleRejectionIgnoresOutlierFollowsShortStep)
 {
 	// GIVEN: the range finder is the height reference with obstacle rejection enabled
 	_ekf_wrapper.setRangeHeightRef();
@@ -745,7 +736,6 @@ TEST_F(EkfHeightFusionTest, rngRefObstacleRejectionIgnoresShortStep)
 	_ekf_wrapper.enableBaroHeightFusion();
 	_ekf->getParamHandle()->ekf2_rng_obst = 1;
 	_ekf->getParamHandle()->ekf2_rng_noise = 0.05f;
-	_ekf->getParamHandle()->ekf2_rng_obst_t = 0.5f;
 	_sensor_simulator.runSeconds(2);
 
 	ASSERT_TRUE(_ekf->getHeightSensorRef() == HeightSensor::RANGE);
@@ -754,14 +744,30 @@ TEST_F(EkfHeightFusionTest, rngRefObstacleRejectionIgnoresShortStep)
 	const float terrain_before = _ekf->getTerrainVertPos();
 	const uint8_t hagl_reset_count = _ekf->get_hagl_reset_count();
 
-	// WHEN: the vehicle crosses a narrow obstacle in less than the confirmation time
+	// WHEN: a single range finder outlier is received between two regular samples
+	_sensor_simulator.stopRangeFinder();
+	_sensor_simulator.runSeconds(0.05);
+	_ekf->setRangeData(estimator::sensor::rangeSample{_sensor_simulator.getTime(), 0.4f, 100});
+	_sensor_simulator.runSeconds(0.2);
+	EXPECT_TRUE(_ekf->aid_src_rng_hgt().innovation_rejected); // the outlier was seen and not fused
+	_sensor_simulator.startRangeFinder();
+	_sensor_simulator.runSeconds(1);
+
+	// THEN: neither the height nor the terrain estimate are affected
+	EXPECT_EQ(_ekf->get_hagl_reset_count(), hagl_reset_count);
+	EXPECT_NEAR(_ekf->getPosition()(2), z_before, 0.05f);
+	EXPECT_NEAR(_ekf->getTerrainVertPos(), terrain_before, 0.02f);
+	EXPECT_NEAR(_ekf->getHagl(), 1.f, 0.05f);
+	EXPECT_FALSE(_ekf->aid_src_rng_hgt().innovation_rejected);
+
+	// AND WHEN: the vehicle crosses a narrow obstacle
 	_sensor_simulator._rng.setData(0.4f, 100);
 	_sensor_simulator.runSeconds(0.3);
 	_sensor_simulator._rng.setData(1.f, 100);
 	_sensor_simulator.runSeconds(2);
 
-	// THEN: neither the height nor the terrain estimate are affected
-	EXPECT_EQ(_ekf->get_hagl_reset_count(), hagl_reset_count);
+	// THEN: the terrain followed the obstacle and is back to the floor, the height is unchanged
+	EXPECT_GT(_ekf->get_hagl_reset_count(), hagl_reset_count);
 	EXPECT_NEAR(_ekf->getPosition()(2), z_before, 0.05f);
 	EXPECT_NEAR(_ekf->getTerrainVertPos(), terrain_before, 0.02f);
 	EXPECT_NEAR(_ekf->getHagl(), 1.f, 0.05f);

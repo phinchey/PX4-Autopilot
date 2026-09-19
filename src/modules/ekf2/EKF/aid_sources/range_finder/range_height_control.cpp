@@ -229,23 +229,25 @@ void Ekf::controlRangeHaglFusion(const imuSample &imu_sample)
 
 					if (isRangeObstacleRejectionActive() && isRangeStepCandidate(aid_src, innov_gate)) {
 						// The distance to the surface below changed while the vehicle height is still supported
-						// by the inertial data: once the step has persisted, attribute it to the terrain
-						// (furniture, a step, ...) instead of the vehicle height
+						// by the inertial data: attribute it to the terrain (furniture, a step, ...) instead of
+						// the vehicle height as soon as two consecutive measurements agree on the new distance
+						// (a single outlier never moves the terrain)
 						aid_src.innovation_rejected = true;
 
-						if (_time_rng_step_start_us == 0) {
-							_time_rng_step_start_us = imu_sample.time_us;
-
-						} else if ((imu_sample.time_us - _time_rng_step_start_us)
-							   >= static_cast<uint64_t>(_params.ekf2_rng_obst_t * 1e6f)) {
+						if (_rng_step_candidate
+						    && (fabsf(aid_src.observation - _rng_step_observation_prev) < getRangeStepThreshold(innov_gate))) {
 							ECL_INFO("%s step, resetting terrain", HGT_SRC_NAME);
 							resetTerrainToRngHoldHeight(aid_src);
-							_time_rng_step_start_us = 0;
+							_rng_step_candidate = false;
 							terrain_reset = true;
+
+						} else {
+							_rng_step_candidate = true;
+							_rng_step_observation_prev = aid_src.observation;
 						}
 
 					} else {
-						_time_rng_step_start_us = 0;
+						_rng_step_candidate = false;
 					}
 
 					if (!terrain_reset && _control_status.flags.rng_kin_consistent) {
@@ -253,7 +255,7 @@ void Ekf::controlRangeHaglFusion(const imuSample &imu_sample)
 					}
 
 				} else {
-					_time_rng_step_start_us = 0;
+					_rng_step_candidate = false;
 				}
 
 				const bool is_fusion_failing = isTimedOut(aid_src.time_last_fuse, _params.hgt_fusion_timeout_max);
@@ -367,16 +369,21 @@ void Ekf::resetTerrainToRng(estimator_aid_source1d_s &aid_src)
 	aid_src.time_last_fuse = _time_delayed_us;
 }
 
+float Ekf::getRangeStepThreshold(float innov_gate) const
+{
+	// difference between two range finder measurements of the same surface that is explained by the
+	// measurement noise (the terrain is known to the precision of the range finder)
+	const float rng_var = sq(_params.ekf2_rng_noise) + sq(_params.ekf2_rng_sfe * _range_sensor.getRange());
+	return innov_gate * sqrtf(2.f * rng_var);
+}
+
 bool Ekf::isRangeStepCandidate(const estimator_aid_source1d_s &aid_src, float innov_gate) const
 {
 	// A change of the surface below the vehicle is a jump of the measured distance that is not
 	// explained by the vehicle motion. The innovation gate scales with the height uncertainty, so
 	// it can be much wider than the step; the step is therefore also compared with the range
-	// finder noise only (the terrain is known to the precision of the range finder)
-	const float rng_var = sq(_params.ekf2_rng_noise) + sq(_params.ekf2_rng_sfe * _range_sensor.getRange());
-	const float step_threshold = innov_gate * sqrtf(2.f * rng_var);
-
-	return aid_src.innovation_rejected || (fabsf(aid_src.innovation) > step_threshold);
+	// finder noise only
+	return aid_src.innovation_rejected || (fabsf(aid_src.innovation) > getRangeStepThreshold(innov_gate));
 }
 
 void Ekf::resetTerrainToRngHoldHeight(estimator_aid_source1d_s &aid_src)
@@ -472,7 +479,7 @@ void Ekf::stopRngHgtFusion()
 		}
 
 		_control_status.flags.rng_hgt = false;
-		_time_rng_step_start_us = 0;
+		_rng_step_candidate = false;
 	}
 }
 
