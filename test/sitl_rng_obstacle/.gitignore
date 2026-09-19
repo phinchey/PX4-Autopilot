@@ -1,0 +1,4 @@
+runs/
+__pycache__/
+# flight logs are 20-30 MB each; kept out of the repository
+results/**/*.ulg

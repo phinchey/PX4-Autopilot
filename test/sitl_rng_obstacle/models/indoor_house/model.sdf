@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Textured floor of the indoor furniture test house (20 x 14 m, centred on the
+  origin).  The floor is split into 2 x 2 visual tiles so that the 1024 px
+  texture is stretched over 10 x 7 m (about 1 cm/pixel), which gives the
+  optical-flow tracker enough contrast at 1.5 m altitude.  The walls and the
+  furniture live in worlds/indoor_furniture.sdf.
+
+  The explicit <diffuse>1 1 1 1</diffuse> is required: gz-sim 8 otherwise
+  multiplies the PBR albedo map by a zero colour and the floor renders black
+  (the flow camera then sees nothing and flow quality is 0).
+-->
+<sdf version="1.9">
+  <model name="indoor_house">
+    <static>true</static>
+    <link name="floor">
+      <collision name="floor_collision">
+        <geometry>
+          <box><size>20 14 0.02</size></box>
+        </geometry>
+        <pose>0 0 -0.01 0 0 0</pose>
+        <surface>
+          <friction><ode/></friction>
+          <bounce/>
+          <contact/>
+        </surface>
+      </collision>
+      <visual name="floor_tile_sw">
+        <pose>-5 -3.5 -0.01 0 0 0</pose>
+        <geometry><box><size>10 7 0.02</size></box></geometry>
+        <material>
+          <diffuse>1 1 1 1</diffuse>
+          <specular>0 0 0 1</specular>
+          <pbr><metal><albedo_map>model://indoor_house/materials/textures/floor.png</albedo_map><metalness>0</metalness><roughness>1</roughness></metal></pbr>
+        </material>
+      </visual>
+      <visual name="floor_tile_se">
+        <pose>5 -3.5 -0.01 0 0 0</pose>
+        <geometry><box><size>10 7 0.02</size></box></geometry>
+        <material>
+          <diffuse>1 1 1 1</diffuse>
+          <specular>0 0 0 1</specular>
+          <pbr><metal><albedo_map>model://indoor_house/materials/textures/floor.png</albedo_map><metalness>0</metalness><roughness>1</roughness></metal></pbr>
+        </material>
+      </visual>
+      <visual name="floor_tile_nw">
+        <pose>-5 3.5 -0.01 0 0 0</pose>
+        <geometry><box><size>10 7 0.02</size></box></geometry>
+        <material>
+          <diffuse>1 1 1 1</diffuse>
+          <specular>0 0 0 1</specular>
+          <pbr><metal><albedo_map>model://indoor_house/materials/textures/floor.png</albedo_map><metalness>0</metalness><roughness>1</roughness></metal></pbr>
+        </material>
+      </visual>
+      <visual name="floor_tile_ne">
+        <pose>5 3.5 -0.01 0 0 0</pose>
+        <geometry><box><size>10 7 0.02</size></box></geometry>
+        <material>
+          <diffuse>1 1 1 1</diffuse>
+          <specular>0 0 0 1</specular>
+          <pbr><metal><albedo_map>model://indoor_house/materials/textures/floor.png</albedo_map><metalness>0</metalness><roughness>1</roughness></metal></pbr>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>
