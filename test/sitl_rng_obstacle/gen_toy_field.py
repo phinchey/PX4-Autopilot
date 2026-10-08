@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Generate models/toy_field/model.sdf: clutter for the range finder tests.
+
+Small static objects in the kitchen of the indoor_furniture world, spawned
+by fly_furniture.py --route clutter only (the furniture route is unchanged):
+
+* a band of toys along y = -3.0 (x from -7.2 to -2.9): blocks, balls, a
+  bucket, books, 6-35 cm tall and 10-35 cm wide, i.e. on both sides of the
+  ~0.23 m step threshold of EKF2_RNG_OBST with EKF2_RNG_NOISE = 0.03.
+  A single range finder ray crossing them sees the floor and a toy top in
+  quick succession, often for only one or two samples at 3 m/s;
+* a children's corner along y = -4.8: a 0.5 m table between two 0.3 m
+  chairs (with backrests and legs) and two more toys.
+
+Poses are world coordinates (the model is spawned at the origin).
+"""
+import os
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.join(HERE, "models", "toy_field", "model.sdf")
+
+COLORS = {
+    "red": "0.85 0.15 0.15", "blue": "0.15 0.35 0.85", "yellow": "0.95 0.8 0.1",
+    "green": "0.2 0.7 0.3", "orange": "0.95 0.5 0.1", "purple": "0.55 0.25 0.7",
+    "wood": "0.6 0.42 0.25", "white": "0.9 0.9 0.9",
+}
+
+
+def material(color):
+    c = COLORS[color]
+    return f"<material><ambient>{c} 1</ambient><diffuse>{c} 1</diffuse><specular>0.1 0.1 0.1 1</specular></material>"
+
+
+def box(name, x, y, sx, sy, sz, color, z0=0.0):
+    """Box standing on z0 (bottom), centred on x, y."""
+    g = f"<box><size>{sx:.3f} {sy:.3f} {sz:.3f}</size></box>"
+    return (f'    <link name="{name}"><pose>{x:.3f} {y:.3f} {z0 + sz / 2:.3f} 0 0 0</pose>'
+            f'<collision name="col"><geometry>{g}</geometry></collision>'
+            f'<visual name="vis"><geometry>{g}</geometry>{material(color)}</visual></link>\n')
+
+
+def cylinder(name, x, y, r, h, color):
+    g = f"<cylinder><radius>{r:.3f}</radius><length>{h:.3f}</length></cylinder>"
+    return (f'    <link name="{name}"><pose>{x:.3f} {y:.3f} {h / 2:.3f} 0 0 0</pose>'
+            f'<collision name="col"><geometry>{g}</geometry></collision>'
+            f'<visual name="vis"><geometry>{g}</geometry>{material(color)}</visual></link>\n')
+
+
+def sphere(name, x, y, r, color):
+    g = f"<sphere><radius>{r:.3f}</radius></sphere>"
+    return (f'    <link name="{name}"><pose>{x:.3f} {y:.3f} {r:.3f} 0 0 0</pose>'
+            f'<collision name="col"><geometry>{g}</geometry></collision>'
+            f'<visual name="vis"><geometry>{g}</geometry>{material(color)}</visual></link>\n')
+
+
+def table(name, x, y, size, height, color):
+    top = 0.03
+    leg = 0.04
+    s = box(f"{name}_top", x, y, size, size, top, color, z0=height - top)
+    d = size / 2 - leg / 2
+    for i, (dx, dy) in enumerate(((d, d), (d, -d), (-d, d), (-d, -d))):
+        s += box(f"{name}_leg{i}", x + dx, y + dy, leg, leg, height - top, color)
+    return s
+
+
+def chair(name, x, y, back_dx, color):
+    """Child's chair: 0.28 m seat at 0.30 m, backrest up to 0.56 m on the
+    side given by back_dx (+1 east, -1 west)."""
+    seat, h, t = 0.28, 0.30, 0.03
+    s = table(name, x, y, seat, h, color)
+    bx = x + back_dx * (seat / 2 - 0.0125)
+    s += box(f"{name}_back", bx, y, 0.025, seat, 0.56 - h, color, z0=h)
+    return s
+
+
+def main():
+    links = ""
+    # toy band along y = -3.0: (kind, x, y, dims..., color)
+    toys = [
+        ("box", -7.20, -2.95, 0.20, 0.20, 0.12, "red"),
+        ("box", -6.75, -3.05, 0.12, 0.12, 0.25, "blue"),
+        ("sphere", -6.40, -3.00, 0.09, "yellow"),
+        ("box", -6.00, -3.10, 0.30, 0.15, 0.10, "green"),
+        ("box", -5.60, -2.90, 0.15, 0.15, 0.30, "orange"),
+        ("box", -5.25, -3.00, 0.25, 0.25, 0.18, "purple"),
+        ("cylinder", -4.85, -3.05, 0.12, 0.35, "red"),
+        ("box", -4.45, -2.95, 0.10, 0.30, 0.06, "white"),
+        ("box", -4.10, -3.00, 0.20, 0.20, 0.22, "blue"),
+        ("sphere", -3.70, -3.10, 0.13, "green"),
+        ("box", -3.30, -2.95, 0.35, 0.25, 0.14, "yellow"),
+        ("box", -2.90, -3.00, 0.12, 0.12, 0.32, "orange"),
+        # a few off the line: only hit when the vehicle drifts sideways
+        ("box", -6.20, -3.35, 0.18, 0.18, 0.16, "purple"),
+        ("sphere", -4.60, -2.65, 0.10, "blue"),
+        ("box", -3.50, -3.40, 0.22, 0.12, 0.28, "red"),
+    ]
+    for i, t in enumerate(toys):
+        kind, x, y = t[0], t[1], t[2]
+        if kind == "box":
+            links += box(f"toy{i}", x, y, t[3], t[4], t[5], t[6])
+        elif kind == "sphere":
+            links += sphere(f"toy{i}", x, y, t[3], t[4])
+        else:
+            links += cylinder(f"toy{i}", x, y, t[3], t[4], t[5])
+    # children's corner along y = -4.8
+    links += box("corner_toy0", -6.40, -4.80, 0.20, 0.20, 0.15, "green")
+    links += chair("chair_w", -5.65, -4.80, -1, "yellow")
+    links += table("kids_table", -5.00, -4.80, 0.60, 0.50, "wood")
+    links += chair("chair_e", -4.35, -4.80, +1, "blue")
+    links += sphere("corner_toy1", -3.70, -4.80, 0.10, "red")
+
+    sdf = ('<?xml version="1.0"?>\n'
+           '<!-- generated by gen_toy_field.py, do not edit -->\n'
+           '<sdf version="1.9">\n  <model name="toy_field">\n    <static>true</static>\n'
+           + links + '  </model>\n</sdf>\n')
+    with open(OUT, "w") as f:
+        f.write(sdf)
+    print(f"wrote {OUT}")
+
+
+if __name__ == "__main__":
+    main()

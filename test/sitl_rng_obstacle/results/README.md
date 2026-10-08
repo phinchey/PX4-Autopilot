@@ -87,3 +87,53 @@ for d in /tmp/obst*; do python3 test/sitl_rng_obstacle/analyze.py $d/*.ulg --out
 Runs without GPS are not deterministic (see the flow drift notes in the
 parent README); a run that aborts with "estimate ... from ground truth" or
 "... from setpoint" drifted too far horizontally and should be repeated.
+
+## Clutter: small objects and range noise parameters
+
+`clutter_gps_030` and `clutter_gps_010` fly the clutter route (toys 6-35 cm
+high, a children's table and chairs, two hovers at the edge of a chair seat and
+of a toy tower, see the parent README) with GPS, `EKF2_RNG_OBST = 1` and a
+simulated time-of-flight sensor with 3 mm range noise (`--lidar-noise 0.003`,
+the noise measured in hover on an ARK Flow). Only `EKF2_RNG_NOISE` differs.
+`clutter_rng_noise_comparison.png` shows both flights.
+
+| run | `EKF2_RNG_NOISE` | step threshold | true alt min / max [m] | est - true RMS / max [m] | dist_bottom / z resets |
+| --- | --- | --- | --- | --- | --- |
+| `clutter_gps_030` | 0.03 | 0.21 m | 1.16 / 1.44 | 0.175 / 0.212 | 41 / 0 |
+| `clutter_gps_010` | 0.01 | 0.07 m | 1.17 / 1.36 | 0.009 / 0.030 | 72 / 0 |
+
+A change of the measured distance is detected as a step of the surface when it
+exceeds `EKF2_RNG_GATE` x sqrt(2) x the range noise. With 0.03 (ten times the
+sensor noise) every toy lower than 0.21 m is fused as a height change: the
+vehicle climbs by up to 0.12 m over each of them and comes back down behind it.
+With 0.01 every toy is a step, the true altitude stays within a few centimetres
+of its cruise value over the toys, the chairs, the table and during both
+flicker hovers, and the estimate is within 3 cm of the true altitude for the
+whole flight. The usual height offset after take-off disappears as well: the
+difference between `EKF2_MIN_RNG` and the sensor height on the ground is larger
+than the threshold, so it is treated as a step at take-off.
+
+The noise parameter should be set to the noise of the sensor with some margin:
+in a replay of a real indoor flight (ARK FPV with an ARK Flow, 2-3 mm range noise
+in hover), 0.01 removed a 13 cm dip of the altitude estimate over a 0.2 m object
+and reduced the error accumulated over a sofa-like object from 23 cm to 6 cm,
+whereas 0.005 classified part of the vehicle's own climb as steps and was worse
+than 0.01.
+
+The furniture route with the same sensor model and `EKF2_RNG_NOISE = 0.01`
+(`furniture_gps_010`, `furniture_nogps_010`) keeps the earlier behaviour over the
+step, the tables and the couch:
+
+| run | GPS | true alt min / max [m] | est - true RMS / max [m] | dist_bottom / z resets |
+| --- | --- | --- | --- | --- |
+| `furniture_gps_010` | yes | 1.17 / 1.41 | 0.014 / 0.051 | 18 / 0 |
+| `furniture_nogps_010` | no | 1.35 / 1.56 | 0.032 / 0.067 | 15 / 0 |
+
+Two other furniture runs ended early. Without GPS (0.01 and 0.03) the optical
+flow drift reached the abort limit, as before. With GPS (0.01) the vehicle hit
+the west wall after the hover above the dining table: while accelerating off the
+table the simulated flow sensor measured 42 % of the true speed (with the correct
+distance to the table top, 0.75 m), so the velocity estimate was too low and
+the vehicle overshot. The simulated flow under-reads over furniture in general
+(65-70 % of the true speed, 106 % over the floor), independently of the range
+finder settings.

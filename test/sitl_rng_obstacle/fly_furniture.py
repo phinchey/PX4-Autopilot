@@ -65,6 +65,10 @@ VIDEO_VIEWS = ("wide", "side")   # sensor names in flight_cameras/model.sdf
 # (yaw pi/2 in ENU) so that the PX4 heading is ~0.
 SPAWN_XY = (-8.5, 1.5)
 SPAWN_YAW = math.pi / 2
+# --route clutter: spawn in the kitchen, next to the toy field (models/toy_field)
+SPAWN_XY_CLUTTER = (-8.5, -3.0)
+TOY_FIELD_SDF = os.path.join(MODELS_DIR, "toy_field", "model.sdf")
+TOY_FIELD_NAME = "toy_field"
 
 WP_REACHED_M = 0.3      # advance to the next leg when within this distance ...
 WP_SETTLED_M_S = 0.4    # ... and slower than this (no corner-cutting at speed)
@@ -74,6 +78,7 @@ ABORT_DRIFT_M = 2.5     # ... or if the estimate is this far from the ground tru
 SETPOINT_HZ = 20.0
 SLOW_SPEED = 1.0        # m/s for the coffee-table pass
 HOVER_S = 4.0           # hover time above the dining table
+HOVER_EDGE_S = 6.0      # hover time at the edge of a chair seat / toy (range flickers)
 
 
 def route(speed, doors=False):
@@ -123,6 +128,44 @@ def route(speed, doors=False):
         ("return to spawn", SPAWN_XY[0], SPAWN_XY[1], SLOW_SPEED, 0.0),
     ]
     return legs
+
+
+def clutter_route(speed):
+    """Clutter route in the kitchen (--route clutter), see gen_toy_field.py:
+      toy band along y = -3.0, x from -7.2 to -2.9, toys 6-35 cm high
+      children's corner along y = -4.8: toy -6.4, chair seat x[-5.79,-5.51] (0.30 m),
+      table x[-5.3,-4.7] (0.50 m), chair seat x[-4.49,-4.21], toy -3.7
+    The two hovers are at the edge of a chair seat and of a 0.30 m toy tower, where the
+    position hold wobble makes the range finder flicker between the object and the floor.
+    """
+    y_toys, y_kids = -3.0, -4.8
+    return [
+        ("SLOW pass over the toys", -1.8, y_toys, SLOW_SPEED, 0.0),
+        ("FAST pass back over the toys", -8.2, y_toys, speed, 0.0),
+        ("to children's corner run-in", -7.4, y_kids, SLOW_SPEED, 0.0),
+        ("SLOW pass over chairs and table", -2.6, y_kids, SLOW_SPEED, 0.0),
+        ("FAST pass back over chairs and table", -7.4, y_kids, speed, 0.0),
+        ("HOVER at the edge of a chair seat", -5.50, y_kids, SLOW_SPEED, HOVER_EDGE_S),
+        ("HOVER at the edge of a toy tower", -5.52, -2.90, SLOW_SPEED, HOVER_EDGE_S),
+        ("return to spawn", SPAWN_XY_CLUTTER[0], SPAWN_XY_CLUTTER[1], SLOW_SPEED, 0.0),
+    ]
+
+
+def make_model_with_lidar_noise(stddev, out_dir):
+    """Copy of models/x500_flow_tof with another range noise, returns its model.sdf path."""
+    with open(MODEL_SDF) as f:
+        sdf = f.read()
+    new = re.sub(r"(<noise>\s*<type>gaussian</type>\s*<mean>0.0</mean>\s*<stddev>)[0-9.]+(</stddev>)",
+                 rf"\g<1>{stddev:g}\g<2>", sdf, count=1)
+    if new == sdf and f"<stddev>{stddev:g}</stddev>" not in sdf:
+        raise RuntimeError("could not find the lidar noise in " + MODEL_SDF)
+    d = os.path.join(out_dir, "x500_flow_tof_lidar_noise")
+    os.makedirs(d, exist_ok=True)
+    shutil.copy(os.path.join(os.path.dirname(MODEL_SDF), "model.config"), d)
+    path = os.path.join(d, "model.sdf")
+    with open(path, "w") as f:
+        f.write(new)
+    return path
 
 
 # --------------------------------------------------------------------------
@@ -232,9 +275,9 @@ def start_gazebo(env, out_dir, render_engine, run=True):
     return proc
 
 
-def spawn_model(env):
+def spawn_model(env, model_sdf=None):
     x, y = SPAWN_XY
-    sdf = (f"<sdf version='1.6'><include><uri>file://{MODEL_SDF}</uri>"
+    sdf = (f"<sdf version='1.6'><include><uri>file://{model_sdf or MODEL_SDF}</uri>"
            f"<pose>{x} {y} 0.3 0 0 {SPAWN_YAW}</pose></include></sdf>")
     req = f'name: "{MODEL_NAME}", allow_renaming: false, sdf: "{sdf}"'
     r = subprocess.run(["gz", "service", "-s", f"/world/{WORLD_NAME}/create",
@@ -246,6 +289,19 @@ def spawn_model(env):
     lidar = f"/world/{WORLD_NAME}/model/{MODEL_NAME}/link/lidar_sensor_link/sensor/lidar/scan"
     wait_for(lambda: lidar in gz_topics(env), 30, "lidar topic of the spawned model")
     log(f"spawned {MODEL_NAME} at {SPAWN_XY}")
+
+
+def spawn_toy_field(env):
+    """Spawn the clutter for --route clutter (models/toy_field, world coordinates)."""
+    sdf = f"<sdf version='1.6'><include><uri>file://{TOY_FIELD_SDF}</uri><pose>0 0 0 0 0 0</pose></include></sdf>"
+    req = f'name: "{TOY_FIELD_NAME}", allow_renaming: false, sdf: "{sdf}"'
+    r = subprocess.run(["gz", "service", "-s", f"/world/{WORLD_NAME}/create",
+                        "--reqtype", "gz.msgs.EntityFactory", "--reptype", "gz.msgs.Boolean",
+                        "--timeout", "5000", "--req", req],
+                       capture_output=True, text=True, env=env, timeout=30)
+    if "data: true" not in r.stdout:
+        raise RuntimeError(f"toy field spawn failed: {r.stdout} {r.stderr}")
+    log("spawned the toy field")
 
 
 def spawn_cameras(env):
@@ -290,8 +346,8 @@ def px4_params(args):
         "EKF2_HGT_REF": 2,          # range finder is the height reference
         "EKF2_RNG_CTRL": 2,         # always fuse the range finder
         "EKF2_RNG_OBST": args.obst,  # feature under test (ignored if unknown to the binary)
-        "EKF2_RNG_NOISE": 0.03,
-        "EKF2_RNG_SFE": 0.0,
+        "EKF2_RNG_NOISE": args.rng_noise,
+        "EKF2_RNG_SFE": args.rng_sfe,
         "EKF2_OF_CTRL": 1,
         # the PX4 shell readbacks pause the offboard setpoint stream for up to a
         # few seconds; do not let the offboard-loss failsafe land the vehicle
@@ -733,7 +789,8 @@ class Flight:
 
         # ----- route
         try:
-            for leg in route(args.speed, args.doors):
+            legs = clutter_route(args.speed) if args.route == "clutter" else route(args.speed, args.doors)
+            for leg in legs:
                 await self.fly_leg(*leg)
             log("route complete, landing")
         except RuntimeError as err:
@@ -820,15 +877,27 @@ def main():
     ap.add_argument("--render-engine", default=None,
                     help="gz render engine override (e.g. ogre) if ogre2 sensors do not render headless")
     ap.add_argument("--keep", action="store_true", help="leave PX4 and gz running after the flight")
+    ap.add_argument("--route", choices=("furniture", "clutter"), default="furniture",
+                    help="furniture: living room route (default); clutter: toys and children's chairs in the kitchen")
+    ap.add_argument("--rng-noise", type=float, default=0.03, help="EKF2_RNG_NOISE [m]")
+    ap.add_argument("--rng-sfe", type=float, default=0.0, help="EKF2_RNG_SFE [m/m]")
+    ap.add_argument("--lidar-noise", type=float, default=None,
+                    help="range noise of the simulated sensor [m] (default: the model's 0.02)")
     ap.add_argument("--video", action="store_true",
                     help="film the flight with two static cameras (wide.mp4, side.mp4, combined flight.mp4)")
     args = ap.parse_args()
 
+    global SPAWN_XY
+    if args.route == "clutter":
+        SPAWN_XY = SPAWN_XY_CLUTTER
+
     if args.out is None:
-        tag = f"{time.strftime('%Y%m%d_%H%M%S')}_obst{args.obst}" + ("_gps" if args.gps else "")
+        tag = (f"{time.strftime('%Y%m%d_%H%M%S')}_{args.route}_obst{args.obst}"
+               + ("_gps" if args.gps else ""))
         args.out = os.path.join(HERE, "runs", tag)
     os.makedirs(args.out, exist_ok=True)
     log(f"output directory: {args.out}")
+    model_sdf = make_model_with_lidar_noise(args.lidar_noise, args.out) if args.lidar_noise is not None else None
 
     kill_stale()
     env = gz_environment()
@@ -839,7 +908,9 @@ def main():
     ulg_before = newest_ulg()
     try:
         gz_proc = start_gazebo(env, args.out, args.render_engine)
-        spawn_model(env)
+        spawn_model(env, model_sdf)
+        if args.route == "clutter":
+            spawn_toy_field(env)
         if args.video:
             spawn_cameras(env)
             VIDEO.update(env=env, out_dir=args.out)

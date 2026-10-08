@@ -1,0 +1,40 @@
+{
+  "status": "ok",
+  "args": {
+    "obst": 1,
+    "gps": true,
+    "speed": 3.0,
+    "alt": 1.5,
+    "alt_trim": 0.0,
+    "out": "furniture_gps_010",
+    "doors": false,
+    "render_engine": null,
+    "keep": false,
+    "route": "furniture",
+    "rng_noise": 0.01,
+    "rng_sfe": 0.0,
+    "lidar_noise": 0.003,
+    "video": false
+  },
+  "px4_params": {
+    "EKF2_HGT_REF": 2,
+    "EKF2_RNG_CTRL": 2,
+    "EKF2_RNG_OBST": 1,
+    "EKF2_RNG_NOISE": 0.01,
+    "EKF2_RNG_SFE": 0.0,
+    "EKF2_OF_CTRL": 1,
+    "COM_OF_LOSS_T": 5.0,
+    "MPC_XY_VEL_MAX": 3.3,
+    "MPC_XY_CRUISE": 3.0,
+    "MPC_VEL_MANUAL": 3.0,
+    "MPC_TILTMAX_AIR": 20.0,
+    "MPC_ACC_HOR_MAX": 2.0,
+    "MPC_ACC_HOR": 2.0,
+    "MPC_LAND_SPEED": 0.7,
+    "SYS_HAS_GPS": 1,
+    "SIM_GPS_USED": 10,
+    "EKF2_GPS_CTRL": 7
+  },
+  "ulg": "17_50_43.ulg",
+  "wall_time_s": 96.0
+}
