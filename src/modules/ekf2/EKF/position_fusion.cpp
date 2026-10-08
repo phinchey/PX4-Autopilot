@@ -256,6 +256,9 @@ void Ekf::resetAltitudeTo(const float new_altitude, float new_vert_pos_var)
 #if defined(CONFIG_EKF2_TERRAIN)
 	updateTerrainResetStatus(delta_z);
 	_state.terrain += delta_z;
+# if defined(CONFIG_EKF2_RANGE_FINDER)
+	shiftRangeSurfaces(delta_z);
+# endif // CONFIG_EKF2_RANGE_FINDER
 #endif // CONFIG_EKF2_TERRAIN
 
 	// Reset the timout timer

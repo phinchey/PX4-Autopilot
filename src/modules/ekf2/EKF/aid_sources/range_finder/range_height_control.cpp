@@ -190,7 +190,7 @@ void Ekf::controlRangeHaglFusion(const imuSample &imu_sample)
 						_information_events.flags.reset_hgt_to_rng = true;
 						resetAltitudeTo(aid_src.observation, aid_src.observation_variance);
 						_state.terrain = 0.f;
-						_rng_obst_terrain_prev = NAN;
+						resetRangeSurfaces(_state.terrain);
 						resetAidSourceStatusZeroInnovation(aid_src);
 					}
 
@@ -353,6 +353,10 @@ void Ekf::resetTerrainToRng(estimator_aid_source1d_s &aid_src)
 
 	measurementUpdate(K, H, aid_src.observation_variance, aid_src.innovation);
 
+	// the measured surface is now the surface level below the vehicle
+	_rng_terrain_ref = _state.terrain;
+	_rng_terrain_ref_since_us = _time_delayed_us;
+
 	// record the state change
 	const float delta_terrain = _state.terrain - old_terrain;
 
@@ -369,12 +373,16 @@ void Ekf::resetTerrainToRng(estimator_aid_source1d_s &aid_src)
 	aid_src.time_last_fuse = _time_delayed_us;
 }
 
+float Ekf::getRangeNoiseVar() const
+{
+	return sq(_params.ekf2_rng_noise) + sq(_params.ekf2_rng_sfe * _range_sensor.getRange());
+}
+
 float Ekf::getRangeStepThreshold(float innov_gate) const
 {
 	// difference between two range finder measurements of the same surface that is explained by the
 	// measurement noise (the terrain is known to the precision of the range finder)
-	const float rng_var = sq(_params.ekf2_rng_noise) + sq(_params.ekf2_rng_sfe * _range_sensor.getRange());
-	return innov_gate * sqrtf(2.f * rng_var);
+	return innov_gate * sqrtf(2.f * getRangeNoiseVar());
 }
 
 bool Ekf::isRangeStepCandidate(const estimator_aid_source1d_s &aid_src, float innov_gate) const
@@ -386,41 +394,129 @@ bool Ekf::isRangeStepCandidate(const estimator_aid_source1d_s &aid_src, float in
 	return aid_src.innovation_rejected || (fabsf(aid_src.innovation) > getRangeStepThreshold(innov_gate));
 }
 
+float Ekf::getRangeSurfaceTolerance(const estimator_aid_source1d_s &aid_src) const
+{
+	// Difference between a measured surface level and a remembered one below which they are the
+	// same surface. It follows the height uncertainty but is capped so that a distinct surface is
+	// never mistaken for a remembered one after a long range finder outage.
+	static constexpr float kSameLevelToleranceMax = 0.3f; // (m)
+	return fminf(3.f * sqrtf(P(State::pos.idx + 2, State::pos.idx + 2) + aid_src.observation_variance),
+		     kSameLevelToleranceMax);
+}
+
+int Ekf::findRangeSurface(const float terrain, const float tolerance) const
+{
+	int best = -1;
+	float best_diff = tolerance;
+
+	for (int i = 0; i < kRangeSurfaceMemorySize; i++) {
+		const RangeSurface &surface = _rng_surfaces[i];
+
+		if (PX4_ISFINITE(surface.terrain)
+		    && !isTimedOut(surface.time_last_seen_us, kRangeSurfaceMemoryTimeoutUs)
+		    && (fabsf(terrain - surface.terrain) < best_diff)) {
+			best = i;
+			best_diff = fabsf(terrain - surface.terrain);
+		}
+	}
+
+	return best;
+}
+
+void Ekf::rememberRangeSurface(const float terrain, const bool persistent)
+{
+	if (!PX4_ISFINITE(terrain)) {
+		return;
+	}
+
+	// a surface already remembered keeps its level, it is the datum the height is anchored to
+	const float same_level = 0.5f * getRangeStepThreshold(math::max(_params.ekf2_rng_gate, 1.f));
+	int slot = findRangeSurface(terrain, same_level);
+
+	if (slot < 0) {
+		// Only surfaces the vehicle stayed over are remembered (the floor, a table, ...): the tops of
+		// small objects crossed quickly are often measured at their edge, and several of them at
+		// similar levels could otherwise be mistaken for each other.
+		if (!persistent) {
+			return;
+		}
+
+		// replace an empty or expired entry, otherwise the one seen longest ago
+		slot = 0;
+
+		for (int i = 0; i < kRangeSurfaceMemorySize; i++) {
+			if (!PX4_ISFINITE(_rng_surfaces[i].terrain)
+			    || isTimedOut(_rng_surfaces[i].time_last_seen_us, kRangeSurfaceMemoryTimeoutUs)) {
+				slot = i;
+				break;
+			}
+
+			if (_rng_surfaces[i].time_last_seen_us < _rng_surfaces[slot].time_last_seen_us) {
+				slot = i;
+			}
+		}
+
+		_rng_surfaces[slot].terrain = terrain;
+	}
+
+	_rng_surfaces[slot].time_last_seen_us = _time_delayed_us;
+}
+
+void Ekf::resetRangeSurfaces(const float terrain)
+{
+	for (RangeSurface &surface : _rng_surfaces) {
+		surface = RangeSurface{};
+	}
+
+	_rng_terrain_ref = terrain;
+	_rng_terrain_ref_since_us = _time_delayed_us;
+}
+
+void Ekf::shiftRangeSurfaces(const float delta_z)
+{
+	// the height datum moved: the surface levels move with the terrain state
+	_rng_terrain_ref += delta_z;
+
+	for (RangeSurface &surface : _rng_surfaces) {
+		surface.terrain += delta_z; // NAN stays NAN
+	}
+}
+
 void Ekf::resetTerrainToRngHoldHeight(estimator_aid_source1d_s &aid_src)
 {
 	// The surface below the vehicle changed (obstacle, step, ...) while the vehicle height is still
 	// supported by the inertial data: move the terrain to match the range finder and keep the height.
 	// The new terrain is considered known to the precision of the range finder, so that the range
 	// finder keeps anchoring the height to it.
-	const float terrain_before_step = _state.terrain;
-	float new_terrain = -_gpos.altitude() + aid_src.observation;
+	const float terrain_meas = -_gpos.altitude() + aid_src.observation;
 
-	// When the vehicle is back over the surface it was flying over before the last step (e.g. the
-	// floor after crossing a table), re-anchor the height to that surface instead so that the small
-	// height error accumulated while the range finder was rejected does not become a permanent
-	// offset of the height datum. The tolerance follows the height uncertainty but is capped so that
-	// a distinct surface is never mistaken for the previous one after a long range finder outage.
-	static constexpr float kSameLevelToleranceMax = 0.3f; // (m)
-	const float same_level_tolerance = fminf(3.f * sqrtf(P(State::pos.idx + 2, State::pos.idx + 2)
-					   + aid_src.observation_variance), kSameLevelToleranceMax);
+	// the surface the vehicle is leaving
+	rememberRangeSurface(_rng_terrain_ref, isTimedOut(_rng_terrain_ref_since_us, kRangeSurfacePersistenceUs));
 
-	if (PX4_ISFINITE(_rng_obst_terrain_prev)
-	    && (fabsf(new_terrain - _rng_obst_terrain_prev) < same_level_tolerance)) {
-		new_terrain = _rng_obst_terrain_prev;
+	float new_terrain = terrain_meas;
 
-		ECL_INFO("RNG back over previous surface, re-anchoring height");
-		_information_events.flags.reset_hgt_to_rng = true;
-		resetAltitudeTo(aid_src.observation - new_terrain); // also shifts the terrain state and records it
+	// When the vehicle is back over a surface it stayed over before (e.g. the floor after crossing a
+	// table), use the remembered level so that the small height error accumulated while the range
+	// finder could not be fused does not become a permanent offset of the height datum: the
+	// following measurements correct the height and the vehicle returns to its altitude above that
+	// surface. The height is never reset here, the position controller would compensate the reset
+	// and keep the error. A larger difference is more likely another surface at a similar level.
+	const int surface = findRangeSurface(terrain_meas, getRangeSurfaceTolerance(aid_src));
+
+	if ((surface >= 0) && (fabsf(terrain_meas - _rng_surfaces[surface].terrain)
+			       < 0.5f * getRangeStepThreshold(math::max(_params.ekf2_rng_gate, 1.f)))) {
+		new_terrain = _rng_surfaces[surface].terrain;
+		_rng_surfaces[surface].time_last_seen_us = _time_delayed_us;
 	}
 
-	_rng_obst_terrain_prev = terrain_before_step;
+	_rng_terrain_ref = new_terrain;
+	_rng_terrain_ref_since_us = _time_delayed_us;
 
 	const float old_terrain = _state.terrain;
 	_state.terrain = new_terrain;
 
 	// the terrain is now known to the precision of the range finder
-	const float terrain_var = sq(_params.ekf2_rng_noise) + sq(_params.ekf2_rng_sfe * _range_sensor.getRange());
-	P.uncorrelateCovarianceSetVariance<State::terrain.dof>(State::terrain.idx, terrain_var);
+	P.uncorrelateCovarianceSetVariance<State::terrain.dof>(State::terrain.idx, getRangeNoiseVar());
 
 	// record the state change
 	const float delta_terrain = _state.terrain - old_terrain;

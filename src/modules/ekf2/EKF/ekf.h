@@ -827,6 +827,12 @@ private:
 		       && _control_status.flags.rng_hgt
 		       && (_height_sensor_ref == HeightSensor::RANGE);
 	}
+	float getRangeNoiseVar() const;
+	float getRangeSurfaceTolerance(const estimator_aid_source1d_s &aid_src) const;
+	void rememberRangeSurface(float terrain, bool persistent);
+	int findRangeSurface(float terrain, float tolerance) const;
+	void resetRangeSurfaces(float terrain);
+	void shiftRangeSurfaces(float delta_z);
 	float getRngVar() const;
 # endif // CONFIG_EKF2_RANGE_FINDER
 
@@ -844,7 +850,20 @@ private:
 
 	bool _rng_step_candidate{false};	///< true if the previous range finder measurement was a candidate change of the surface below the vehicle
 	float _rng_step_observation_prev{0.f};	///< previous candidate range finder measurement (m)
-	float _rng_obst_terrain_prev{NAN};	///< terrain state before the last obstacle terrain reset, used to re-anchor the height when flying back over the same surface (m)
+
+	// Surface levels seen while holding altitude over obstacles. The height is re-anchored to a remembered
+	// level when the vehicle flies back over it, so that the small height error accumulated while the range
+	// finder could not be fused does not become a permanent offset of the height datum.
+	struct RangeSurface {
+		float terrain{NAN};		///< terrain state of the surface (m)
+		uint64_t time_last_seen_us{0};	///< last time the vehicle was over this surface
+	};
+	static constexpr uint8_t kRangeSurfaceMemorySize{4};
+	static constexpr uint64_t kRangeSurfaceMemoryTimeoutUs{60'000'000};
+	static constexpr uint64_t kRangeSurfacePersistenceUs{500'000};	///< minimum time over a surface for it to be remembered
+	RangeSurface _rng_surfaces[kRangeSurfaceMemorySize] {};
+	float _rng_terrain_ref{0.f};	///< terrain level of the surface currently below the vehicle (m)
+	uint64_t _rng_terrain_ref_since_us{0};	///< time the vehicle arrived over the current surface
 	void stopRngTerrFusion();
 #endif // CONFIG_EKF2_RANGE_FINDER
 

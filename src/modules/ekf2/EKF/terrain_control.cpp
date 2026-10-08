@@ -47,6 +47,11 @@ void Ekf::initTerrain()
 
 	// use the ground clearance value as our uncertainty
 	P.uncorrelateCovarianceSetVariance<State::terrain.dof>(State::terrain.idx, sq(_params.ekf2_min_rng));
+
+#if defined(CONFIG_EKF2_RANGE_FINDER)
+	// the surface below the vehicle is the new terrain
+	resetRangeSurfaces(_state.terrain);
+#endif // CONFIG_EKF2_RANGE_FINDER
 }
 
 void Ekf::controlTerrainFakeFusion()
